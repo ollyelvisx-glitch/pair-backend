@@ -30,7 +30,7 @@ async function startWhatsAppBot() {
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
-        const { connection, qr, lastDisconnect } = update;
+        const { connection, qr } = update;
 
         if (qr) {
             currentQR = qr;
@@ -53,7 +53,7 @@ async function startWhatsAppBot() {
 
         const senderJid = m.key.remoteJid;
 
-        // 1. Extract text safely
+        // 1. Extract text safely across message types
         const text = m.message.conversation || 
                      m.message.extendedTextMessage?.text || 
                      m.message.imageMessage?.caption || 
@@ -61,28 +61,7 @@ async function startWhatsAppBot() {
 
         console.log(`[Incoming Message] From ${senderJid}: "${text}"`);
 
-        // 2. Anti-View Once Catcher
-        const messageType = Object.keys(m.message)[0];
-        if (messageType === 'viewOnceMessage' || messageType === 'viewOnceMessageV2') {
-            try {
-                const buffer = await downloadMediaMessage(
-                    m,
-                    'buffer',
-                    {},
-                    { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
-                );
-                const myNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
-                await sock.sendMessage(myNumber, {
-                    image: buffer,
-                    caption: `🔓 *Saved View-Once Media* from ${senderJid}`
-                });
-            } catch (err) {
-                console.error("Failed to save view-once:", err);
-            }
-            return;
-        }
-
-        // 3. Command Handler
+        // 2. Command Handler
         if (!text.startsWith('.')) return;
 
         const command = text.slice(1).trim().split(' ')[0].toLowerCase();
@@ -91,13 +70,71 @@ async function startWhatsAppBot() {
         if (command === 'ping') {
             await sock.sendMessage(senderJid, { text: 'Pong! Bot is online and listening 🟢' }, { quoted: m });
         } 
-        else if (command === 'settings') {
+        else if (command === 'settings' || command === 'setting') {
             const settingsMsg = 
                 `⚙️ *BOT SETTINGS PANEL* ⚙️\n\n` +
                 `• *Prefix:* .\n` +
-                `• *Anti-View Once:* Active 🟢\n` +
+                `• *Anti-View Once (.vv2):* Active 🟢\n` +
                 `• *Status:* Connected & Responsive`;
-            await sock.sendMessage(settingsMsg, { text: settingsMsg }, { quoted: m });
+            await sock.sendMessage(senderJid, { text: settingsMsg }, { quoted: m });
+        }
+        else if (command === 'vv2' || command === 'vv') {
+            const quotedMessage = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            
+            if (!quotedMessage) {
+                await sock.sendMessage(senderJid, { text: '❌ Please reply to a View-Once message with .vv2' }, { quoted: m });
+                return;
+            }
+
+            let mediaMessage = null;
+            if (quotedMessage.viewOnceMessage?.message) {
+                mediaMessage = quotedMessage.viewOnceMessage.message;
+            } else if (quotedMessage.viewOnceMessageV2?.message) {
+                mediaMessage = quotedMessage.viewOnceMessageV2.message;
+            } else if (quotedMessage.imageMessage?.viewOnce || quotedMessage.videoMessage?.viewOnce) {
+                mediaMessage = quotedMessage;
+            }
+
+            if (!mediaMessage) {
+                await sock.sendMessage(senderJid, { text: '❌ The replied message is not a View-Once media.' }, { quoted: m });
+                return;
+            }
+
+            try {
+                const tempMsg = {
+                    key: {
+                        remoteJid: senderJid,
+                        id: m.message.extendedTextMessage.contextInfo.stanzaId,
+                        participant: m.message.extendedTextMessage.contextInfo.participant
+                    },
+                    message: mediaMessage
+                };
+
+                const buffer = await downloadMediaMessage(
+                    tempMsg,
+                    'buffer',
+                    {},
+                    { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
+                );
+
+                const myNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+
+                if (mediaMessage.videoMessage) {
+                    await sock.sendMessage(myNumber, {
+                        video: buffer,
+                        caption: `🔓 *Unlocked View-Once Video* via .vv2`
+                    });
+                } else if (mediaMessage.imageMessage) {
+                    await sock.sendMessage(myNumber, {
+                        image: buffer,
+                        caption: `🔓 *Unlocked View-Once Image* via .vv2`
+                    });
+                }
+                console.log(`[Anti-View Once .vv2] Successfully unlocked and sent media!`);
+            } catch (err) {
+                console.error("Failed to download quoted view-once:", err);
+                await sock.sendMessage(senderJid, { text: '❌ Failed to download media.' }, { quoted: m });
+            }
         }
     });
 }
@@ -124,5 +161,5 @@ app.get('/ping', (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🚀 Server active on port ${PORT}`);
-    startWhatsAppBot(); // Start the bot when the server boots up
+    startWhatsAppBot();
 });
