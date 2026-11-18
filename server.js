@@ -1,422 +1,232 @@
-const express = require('express');
-const cors = require('cors');
-const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
-const crypto = require('crypto');
-const QRCode = require('qrcode');
+const pino = require('pino');
+const baileys = require('@whiskeysockets/baileys');
+const makeWASocket = baileys.default;
+const { useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, downloadMediaMessage } = baileys;
 
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    fetchLatestBaileysVersion,
-    downloadMediaMessage,
-    DisconnectReason
-} = require('@whiskeysockets/baileys');
+const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, '..', 'data'));
+const authDir = path.join(dataDir, 'auth_info_baileys');
+fs.mkdirSync(authDir, { recursive: true });
 
-const app = express();
+let sock = null;
+let qr = null;
+let connected = false;
+let connecting = false;
+let reconnectTimer = null;
+let lastError = null;
+const logger = pino({ level: process.env.LOG_LEVEL || 'silent' });
+const prefix = process.env.PREFIX || '.';
+const botName = process.env.BOT_NAME || 'OLLY MD';
+const ownerNumber = String(process.env.OWNER_NUMBER || '').replace(/\D/g, '');
 
-app.use(cors());
-app.use(express.json());
+// 🧠 In-Memory Message Store Cache (Remembers recent incoming messages to retrieve view-once keys)
+const messageStore = new Map();
 
-const PORT = process.env.PORT || 3000;
-const API_KEY = process.env.API_KEY;
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+function unwrapMessage(message) {
+  let current = message;
+  while (current) {
+    if (current.ephemeralMessage?.message) current = current.ephemeralMessage.message;
+    else if (current.documentWithCaptionMessage?.message) current = current.documentWithCaptionMessage.message;
+    else if (current.viewOnceMessage || current.viewOnceMessageV2 || current.viewOnceMessageV2Extension) return current;
+    else break;
+  }
+  return current || {};
+}
+function getText(message) {
+  const m = unwrapMessage(message);
+  if (!m) return '';
+  return m.conversation || m.extendedTextMessage?.text || m.imageMessage?.caption || m.videoMessage?.caption || m.documentMessage?.caption || '';
+}
+function getQuoted(message) {
+  const m = unwrapMessage(message);
+  return m?.extendedTextMessage?.contextInfo?.quotedMessage || null;
+}
+function isViewOnce(message) {
+  if (!message) return false;
+  return Boolean(message.viewOnceMessage || message.viewOnceMessageV2 || message.viewOnceMessageV2Extension || message.imageMessage?.viewOnce || message.videoMessage?.viewOnce);
+}
+function jidNumber(jid = '') { return jid.split('@')[0].split(':')[0].replace(/\D/g, ''); }
 
-if (!API_KEY) {
-    throw new Error('Set API_KEY in your hosting environment.');
+async function sendText(jid, text, quoted) {
+  if (!sock) return;
+  await sock.sendMessage(jid, { text }, quoted ? { quoted } : {});
 }
 
-const SESSION_DIR = path.join(DATA_DIR, 'sessions');
-const DOWNLOAD_DIR = path.join(DATA_DIR, 'downloads');
+async function handleMessage(m) {
+  if (!m?.message || m.key?.fromMe) return;
+  const jid = m.key.remoteJid;
+  if (!jid || jid === 'status@broadcast') return;
+  
+  // Cache the incoming message in our store
+  if (m.key && m.key.id) {
+    messageStore.set(m.key.id, m);
+    if (messageStore.size > 500) {
+      const firstKey = messageStore.keys().next().value;
+      messageStore.delete(firstKey);
+    }
+  }
 
-fs.mkdirSync(SESSION_DIR, { recursive: true });
-fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+  const text = getText(m.message).trim();
+  if (!text.startsWith(prefix)) return;
+  const [rawCommand, ...args] = text.slice(prefix.length).trim().split(/\s+/);
+  const command = (rawCommand || '').toLowerCase();
+  const query = args.join(' ');
+  const quoted = getQuoted(m.message);
+  const sender = m.key.participant || jid;
+  const senderNum = jidNumber(sender);
+  const isOwner = ownerNumber && senderNum === ownerNumber;
 
-const logger = pino({ level: 'silent' });
-const sessions = new Map();
+  try {
+    if (command === 'ping') return sendText(jid, 'Pong! OLLY MD is online 🟢', m);
+    if (command === 'alive') return sendText(jid, `🤖 *${botName} is alive!*\nPrefix: ${prefix}\nStatus: Connected 🟢`, m);
+    if (command === 'menu' || command === 'help') {
+      return sendText(jid,
+        `╭━━━〔 *${botName}* 〕━━━╮\n` +
+        `┃ ${prefix}ping – Check response\n┃ ${prefix}alive – Bot status\n┃ ${prefix}menu – Show commands\n┃ ${prefix}save – Save ordinary quoted media\n┃ ${prefix}sticker – Make sticker from image/video\n┃ ${prefix}vv2 – Anti-View Once retrieve\n╰━━━━━━━━━━━━━━━━━━╯\n` +
+        `More commands will be added in later versions.`, m);
+    }
+    if (command === 'settings' || command === 'setting') {
+      return sendText(jid, `⚙️ *${botName} SETTINGS*\nPrefix: ${prefix}\nMode: Single linked WhatsApp account\nConnection: ${connected ? 'Online 🟢' : 'Offline 🔴'}`, m);
+    }
+    
+    // 🔓 Full Anti-View Once (.vv2 / .vv) Handler
+    if (command === 'vv2' || command === 'vv') {
+      const contextInfo = m.message?.extendedTextMessage?.contextInfo;
+      const quotedId = contextInfo?.stanzaId;
 
-function validId(id) {
-    return /^[a-zA-Z0-9_-]{1,40}$/.test(id);
+      if (!quotedId) {
+        return sendText(jid, '❌ Please reply to an unopened View-Once message with .vv2', m);
+      }
+
+      // Look up original raw message in our memory cache
+      const originalMessage = messageStore.get(quotedId);
+      if (!originalMessage) {
+        return sendText(jid, '❌ Original message not found in bot cache. Try replying to a newer view-once message.', m);
+      }
+
+      const quotedMsgContainer = originalMessage.message;
+      const viewOnceObj = quotedMsgContainer?.viewOnceMessage || quotedMsgContainer?.viewOnceMessageV2 || quotedMsgContainer?.viewOnceMessageV2Extension;
+      const innerMsg = viewOnceObj?.message;
+
+      if (!innerMsg || (!innerMsg.imageMessage && !innerMsg.videoMessage)) {
+        return sendText(jid, '❌ The replied message is not a valid View-Once media container.', m);
+      }
+
+      try {
+        const buffer = await downloadMediaMessage(
+          originalMessage,
+          'buffer',
+          {},
+          { logger, reuploadRequest: sock.updateMediaMessage }
+        );
+
+        const myNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+        const targetJid = isOwner ? myNumber : jid; // Sends to owner or chat
+
+        if (innerMsg.videoMessage) {
+          await sock.sendMessage(targetJid, {
+            video: buffer,
+            caption: `🔓 *Unlocked View-Once Video* via .vv2`
+          });
+        } else if (innerMsg.imageMessage) {
+          await sock.sendMessage(targetJid, {
+            image: buffer,
+            caption: `🔓 *Unlocked View-Once Image* via .vv2`
+          });
+        }
+        if (targetJid !== jid) {
+          await sendText(jid, '✅ View-Once media successfully decrypted and sent to your chat!', m);
+        }
+      } catch (err) {
+        console.error('[.vv2 Download Error]:', err);
+        return sendText(jid, `❌ Download Error: ${err.message}`, m);
+      }
+      return;
+    }
+
+    if (command === 'save') {
+      if (!quoted) return sendText(jid, `Reply to a normal image, video, audio or document with ${prefix}save.`, m);
+      if (isViewOnce(quoted)) return sendText(jid, 'Please use .vv2 for View Once media.', m);
+      const q = unwrapMessage(quoted);
+      if (!q || !['imageMessage', 'videoMessage', 'audioMessage', 'documentMessage'].some(k => q[k])) return sendText(jid, 'The quoted message is not a supported ordinary media file.', m);
+      const quotedMessage = { key: { remoteJid: jid, id: m.message.extendedTextMessage?.contextInfo?.stanzaId, participant: m.message.extendedTextMessage?.contextInfo?.participant }, message: q };
+      const buffer = await downloadMediaMessage(quotedMessage, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage });
+      const type = q.imageMessage ? 'image' : q.videoMessage ? 'video' : q.audioMessage ? 'audio' : 'document';
+      const payload = type === 'image' ? { image: buffer, caption: 'Saved with OLLY MD.' }
+        : type === 'video' ? { video: buffer, caption: 'Saved with OLLY MD.' }
+        : type === 'audio' ? { audio: buffer, mimetype: q.audioMessage.mimetype || 'audio/mpeg' }
+        : { document: buffer, mimetype: q.documentMessage.mimetype || 'application/octet-stream', fileName: q.documentMessage.fileName || 'download' };
+      return sock.sendMessage(jid, payload, { quoted: m });
+    }
+    if (command === 'owner') {
+      return sendText(jid, ownerNumber ? `Bot owner: wa.me/${ownerNumber}` : 'Owner contact has not been configured.', m);
+    }
+    if (command === 'restart') {
+      if (!isOwner) return sendText(jid, 'Owner-only command.', m);
+      await sendText(jid, 'Restarting OLLY MD…', m);
+      return restartBot();
+    }
+  } catch (err) {
+    console.error(`[Command ${command}]`, err);
+    await sendText(jid, '❌ Something went wrong while running that command. Check the server logs.', m).catch(() => {});
+  }
 }
 
-function authenticate(req, res, next) {
-    if (req.headers.authorization !== `Bearer ${API_KEY}`) {
-        return res.status(401).json({
-            success: false,
-            error: 'Unauthorized'
-        });
-    }
-
-    next();
-}
-
-app.use('/sessions', authenticate);
-
-function getSession(id) {
-    return sessions.get(id);
-}
-
-async function startWhatsAppBot(userId) {
-    if (!validId(userId)) {
-        throw new Error('Invalid user ID');
-    }
-
-    const old = sessions.get(userId);
-
-    if (old?.starting || old?.sock) return old;
-
-    const session = {
-        sock: null,
-        qr: null,
-        connected: false,
-        starting: true,
-        reconnectTimer: null,
-        stopped: false
-    };
-
-    sessions.set(userId, session);
-
-    try {
-        const authFolder = path.join(SESSION_DIR, userId);
-
-        fs.mkdirSync(authFolder, { recursive: true });
-
-        const { state, saveCreds } =
-            await useMultiFileAuthState(authFolder);
-
-        const { version } = await fetchLatestBaileysVersion();
-
-        const sock = makeWASocket({
-            version,
-            logger,
-            auth: state,
-            printQRInTerminal: false,
-            browser: ['OLLY MD', 'Chrome', '2.0.0'],
-            syncFullHistory: false
-        });
-
-        session.sock = sock;
-        session.starting = false;
-
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('connection.update', ({ connection, qr, lastDisconnect }) => {
-
-            if (qr) {
-                session.qr = qr;
-                console.log(`[${userId}] QR generated`);
-            }
-
-            if (connection === 'open') {
-                session.connected = true;
-                session.qr = null;
-                console.log(`[${userId}] Connected`);
-            }
-
-            if (connection === 'close') {
-                session.connected = false;
-                session.sock = null;
-
-                const code = lastDisconnect?.error?.output?.statusCode;
-
-                if (
-                    code === DisconnectReason.loggedOut ||
-                    session.stopped
-                ) {
-                    session.qr = null;
-                    return;
-                }
-
-                if (!session.reconnectTimer) {
-                    session.reconnectTimer = setTimeout(() => {
-                        session.reconnectTimer = null;
-
-                        startWhatsAppBot(userId).catch(console.error);
-                    }, 5000);
-                }
-            }
-        });
-
-        sock.ev.on('messages.upsert', async ({ messages, type }) => {
-            if (type !== 'notify') return;
-
-            for (const m of messages) {
-                if (!m.message || m.key.fromMe) continue;
-
-                const sender = m.key.remoteJid;
-
-                if (!sender || sender === 'status@broadcast') continue;
-
-                const text =
-                    m.message.conversation ||
-                    m.message.extendedTextMessage?.text ||
-                    '';
-
-                if (!text.startsWith('.')) continue;
-
-                const command = text.trim().split(/\s+/)[0].slice(1).toLowerCase();
-
-                try {
-                    if (command === 'ping') {
-                        await sock.sendMessage(sender, {
-                            text: '🏓 Pong! OLLY MD is online.'
-                        }, { quoted: m });
-                    }
-
-                    else if (command === 'alive') {
-                        await sock.sendMessage(sender, {
-                            text: '🟢 OLLY MD is alive!'
-                        }, { quoted: m });
-                    }
-
-                    else if (command === 'menu' || command === 'help') {
-                        await sock.sendMessage(sender, {
-                            text:
-                                '╭━━━〔 OLLY MD 〕━━━╮\n\n' +
-                                '🏓 .ping - Check bot\n' +
-                                '🟢 .alive - Bot status\n' +
-                                '📥 .download - Save eligible quoted media\n' +
-                                '⚙️ .settings - Settings\n' +
-                                '📋 .menu - Commands\n\n' +
-                                '╰━━━━━━━━━━━━━━━━╯'
-                        }, { quoted: m });
-                    }
-
-                    else if (command === 'settings') {
-                        await sock.sendMessage(sender, {
-                            text:
-                                '⚙️ OLLY MD SETTINGS\n\n' +
-                                `Connection: ${session.connected ? 'Online 🟢' : 'Offline 🔴'}\n` +
-                                'Version: 2.0.0\n' +
-                                'Multi-user: Enabled'
-                        }, { quoted: m });
-                    }
-
-                    else if (command === 'download') {
-                        const context = m.message.extendedTextMessage?.contextInfo;
-                        const quoted = context?.quotedMessage;
-
-                        if (!quoted) {
-                            await sock.sendMessage(sender, {
-                                text: 'Reply to a normal photo, video, audio or document with .download.'
-                            }, { quoted: m });
-                            continue;
-                        }
-
-                        const mediaMessage =
-                            quoted.imageMessage ||
-                            quoted.videoMessage ||
-                            quoted.audioMessage ||
-                            quoted.documentMessage;
-
-                        if (!mediaMessage) {
-                            await sock.sendMessage(sender, {
-                                text: 'Unsupported media. Send a normal photo, video, audio or document.'
-                            }, { quoted: m });
-                            continue;
-                        }
-
-                        try {
-                            const quotedKey = {
-                                remoteJid: sender,
-                                id: context.stanzaId,
-                                participant: context.participant
-                            };
-
-                            const quotedMsg = {
-                                key: quotedKey,
-                                message: quoted
-                            };
-
-                            const buffer = await downloadMediaMessage(
-                                quotedMsg,
-                                'buffer',
-                                {},
-                                {
-                                    logger,
-                                    reuploadRequest: sock.updateMediaMessage
-                                }
-                            );
-
-                            if (!buffer || !buffer.length) {
-                                throw new Error('Empty media buffer');
-                            }
-
-                            const userFolder = path.join(DOWNLOAD_DIR, userId);
-
-                            fs.mkdirSync(userFolder, { recursive: true });
-
-                            const extension =
-                                mediaMessage.mimetype?.split('/')[1]?.split(';')[0] || 'bin';
-
-                            const safeExtension = extension.replace(/[^a-zA-Z0-9]/g, '');
-
-                            const filename =
-                                `${Date.now()}_${crypto.randomBytes(4).toString('hex')}.${safeExtension}`;
-
-                            const filePath = path.join(userFolder, filename);
-
-                            fs.writeFileSync(filePath, buffer);
-
-                            const mediaType = mediaMessage.imageMessage
-                                ? 'image'
-                                : mediaMessage.videoMessage
-                                    ? 'video'
-                                    : mediaMessage.audioMessage
-                                        ? 'audio'
-                                        : 'document';
-
-                            await sock.sendMessage(sender, {
-                                text: `✅ ${mediaType.toUpperCase()} saved successfully.\nFile: ${filename}`
-                            }, { quoted: m });
-
-                        } catch (error) {
-                            console.error(`[${userId}] Download error:`, error);
-
-                            await sock.sendMessage(sender, {
-                                text: '❌ Download failed. Check the media format and server logs.'
-                            }, { quoted: m });
-                        }
-                    }
-
-                } catch (error) {
-                    console.error(`[${userId}] Command error:`, error);
-                }
-            }
-        });
-
-        return session;
-
-    } catch (error) {
-        session.starting = false;
-        session.sock = null;
-
-        throw error;
-    }
-}
-
-// Start a user's WhatsApp session
-app.post('/sessions/:userId/start', async (req, res) => {
-    try {
-        const session = await startWhatsAppBot(req.params.userId);
-
-        res.json({
-            success: true,
-            connected: session.connected,
-            message: 'Session initialized'
-        });
-
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-// Get user's QR
-app.get('/sessions/:userId/qr', async (req, res) => {
-    const session = getSession(req.params.userId);
-
-    if (!session) {
-        return res.status(404).json({
-            success: false,
-            error: 'Start the session first.'
-        });
-    }
-
-    if (session.connected) {
-        return res.json({
-            success: true,
-            connected: true
-        });
-    }
-
-    if (!session.qr) {
-        return res.json({
-            success: false,
-            message: 'QR not ready yet.'
-        });
-    }
-
-    try {
-        const qrImage = await QRCode.toDataURL(session.qr);
-
-        res.json({
-            success: true,
-            connected: false,
-            qrImage
-        });
-
-    } catch (error) {
-        res.status(500).json({
-            success: false,
-            error: 'QR generation failed'
-        });
-    }
-});
-
-// Check session status
-app.get('/sessions/:userId/status', (req, res) => {
-    const session = getSession(req.params.userId);
-
-    if (!session) {
-        return res.status(404).json({
-            success: false,
-            error: 'Session not found'
-        });
-    }
-
-    res.json({
-        success: true,
-        connected: session.connected
+async function startBot() {
+  if (connecting || (sock && connected)) return;
+  connecting = true;
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(authDir);
+    const { version } = await fetchLatestBaileysVersion();
+    sock = makeWASocket({ version, logger, printQRInTerminal: false, auth: state, browser: [botName, 'Chrome', '1.0.0'], markOnlineOnConnect: true });
+    sock.ev.on('creds.update', saveCreds);
+    sock.ev.on('connection.update', update => {
+      const { connection, lastDisconnect, qr: nextQr } = update;
+      if (nextQr) { qr = nextQr; console.log('[OLLY MD] QR code is ready.'); }
+      if (connection === 'open') { connected = true; qr = null; lastError = null; console.log('[OLLY MD] WhatsApp connected.'); }
+      if (connection === 'close') {
+        connected = false;
+        const status = lastDisconnect?.error?.output?.statusCode;
+        lastError = lastDisconnect?.error?.message || 'Connection closed';
+        if (status === DisconnectReason.loggedOut) {
+          console.error('[OLLY MD] Logged out. Clear the saved session and pair again.');
+          sock = null;
+        } else {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = setTimeout(() => startBot().catch(console.error), 5000);
+        }
+      }
     });
-});
-
-// Disconnect session
-app.delete('/sessions/:userId', async (req, res) => {
-    const userId = req.params.userId;
-    const session = getSession(userId);
-
-    if (!session) {
-        return res.status(404).json({
-            success: false,
-            error: 'Session not found'
-        });
-    }
-
-    session.stopped = true;
-
-    if (session.reconnectTimer) {
-        clearTimeout(session.reconnectTimer);
-    }
-
-    sessions.delete(userId);
-
-    try {
-        await session.sock?.logout();
-    } catch (error) {
-        console.error('Logout error:', error.message);
-    }
-
-    res.json({
-        success: true,
-        message: 'WhatsApp disconnected'
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      if (type !== 'notify') return;
+      for (const message of messages) await handleMessage(message);
     });
-});
+  } finally { connecting = false; }
+}
 
-app.get('/ping', (req, res) => {
-    res.json({
-        status: 'online',
-        bot: 'OLLY MD',
-        version: '2.0.0',
-        activeSessions: sessions.size,
-        time: Date.now()
-    });
-});
-
-app.listen(PORT, () => {
-    console.log(`🚀 OLLY MD running on port ${PORT}`);
-    console.log(`Storage: ${DATA_DIR}`);
-});
+async function requestPairingCode(phone) {
+  if (connected) throw new Error('WhatsApp is already connected.');
+  if (!sock) await startBot();
+  if (!sock?.requestPairingCode) throw new Error('Pairing is not ready. Wait a few seconds and try again.');
+  const code = await sock.requestPairingCode(phone);
+  qr = null;
+  return code;
+}
+async function restartBot() {
+  clearTimeout(reconnectTimer);
+  if (sock) { try { sock.end(undefined); } catch {} }
+  sock = null; connected = false; qr = null;
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  return startBot();
+}
+async function logoutBot() {
+  clearTimeout(reconnectTimer);
+  if (sock) { try { await sock.logout(); } catch {} }
+  sock = null; connected = false; qr = null;
+  fs.rmSync(authDir, { recursive: true, force: true });
+  fs.mkdirSync(authDir, { recursive: true });
+}
+function getBotState() { return { connected, qrAvailable: Boolean(qr), lastError, botName }; }
+function getCurrentQr() { return qr; }
+module.exports = { startBot, getBotState, getCurrentQr, requestPairingCode, restartBot, logoutBot };
