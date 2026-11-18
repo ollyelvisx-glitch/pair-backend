@@ -3,9 +3,8 @@ const cors = require('cors');
 const pino = require('pino');
 const path = require('path');
 const QRCode = require('qrcode');
-const { rimraf } = require('rimraf');
 const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { useMultiFileAuthState, fetchLatestBaileysVersion, downloadMediaMessage } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(cors());
@@ -37,17 +36,62 @@ app.get('/qr', async (req, res) => {
             }
 
             if (connection === 'open') {
-                console.log(`[+] Device linked successfully via QR!`);
+                console.log(`[+] Bot connected and listening!`);
             }
         });
 
-        // Give socket a couple seconds to generate the QR
+        // Listen for incoming messages & commands
+        sock.ev.on('messages.upsert', async ({ messages, type }) => {
+            if (type !== 'notify') return;
+            const m = messages[0];
+            if (!m.message) return;
+
+            const senderJid = m.key.remoteJid;
+            const messageType = Object.keys(m.message)[0];
+
+            // 1. Anti-View Once Catcher
+            if (messageType === 'viewOnceMessage' || messageType === 'viewOnceMessageV2') {
+                try {
+                    const buffer = await downloadMediaMessage(
+                        m,
+                        'buffer',
+                        {},
+                        { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
+                    );
+                    const myNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
+                    await sock.sendMessage(myNumber, {
+                        image: buffer,
+                        caption: `🔓 *Saved View-Once Media* from ${senderJid}`
+                    });
+                } catch (err) {
+                    console.error("Failed to save view-once:", err);
+                }
+                return;
+            }
+
+            // 2. Command Handler (Works even if you send it to yourself)
+            const text = m.message.conversation || m.message.extendedTextMessage?.text || '';
+            if (!text.startsWith('.')) return;
+
+            const command = text.slice(1).trim().toLowerCase();
+
+            if (command === 'ping') {
+                await sock.sendMessage(senderJid, { text: 'Pong! Bot is online 🟢' }, { quoted: m });
+            } else if (command === 'settings') {
+                const settingsMsg =
+                    `⚙️ *BOT SETTINGS* ⚙️\n\n` +
+                    `• *Prefix:* .\n` +
+                    `• *Anti-View Once:* Active 🟢\n` +
+                    `• *Status:* Connected`;
+                await sock.sendMessage(senderJid, { text: settingsMsg }, { quoted: m });
+            }
+        });
+
         setTimeout(async () => {
             if (currentQR) {
                 try {
-                    // Generate a data URL image of the QR code
                     const qrImage = await QRCode.toDataURL(currentQR);
-                    res.json({ success: true, qrImage: qrImage });
+                    res.json({ success: true, qrImage });
                 } catch (err) {
                     res.status(500).json({ error: "Failed to render QR image" });
                 }
@@ -67,4 +111,4 @@ app.get('/ping', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 QR Pairing server active on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Bot server active on port ${PORT}`));
