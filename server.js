@@ -40,16 +40,24 @@ app.get('/qr', async (req, res) => {
             }
         });
 
-        // Listen for incoming messages & commands
+        // Robust message event listener & command handler
         sock.ev.on('messages.upsert', async ({ messages, type }) => {
             if (type !== 'notify') return;
             const m = messages[0];
             if (!m.message) return;
 
             const senderJid = m.key.remoteJid;
-            const messageType = Object.keys(m.message)[0];
 
-            // 1. Anti-View Once Catcher
+            // 1. Extract text safely across different message types
+            const text = m.message.conversation || 
+                         m.message.extendedTextMessage?.text || 
+                         m.message.imageMessage?.caption || 
+                         m.message.videoMessage?.caption || '';
+
+            console.log(`[Incoming Message] From ${senderJid}: "${text}"`);
+
+            // 2. Anti-View Once Catcher
+            const messageType = Object.keys(m.message)[0];
             if (messageType === 'viewOnceMessage' || messageType === 'viewOnceMessageV2') {
                 try {
                     const buffer = await downloadMediaMessage(
@@ -69,20 +77,21 @@ app.get('/qr', async (req, res) => {
                 return;
             }
 
-            // 2. Command Handler (Works even if you send it to yourself)
-            const text = m.message.conversation || m.message.extendedTextMessage?.text || '';
+            // 3. Command Handler (Triggers on prefix .)
             if (!text.startsWith('.')) return;
 
-            const command = text.slice(1).trim().toLowerCase();
+            const command = text.slice(1).trim().split(' ')[0].toLowerCase();
+            console.log(`[Command Triggered] -> ${command}`);
 
             if (command === 'ping') {
-                await sock.sendMessage(senderJid, { text: 'Pong! Bot is online 🟢' }, { quoted: m });
-            } else if (command === 'settings') {
-                const settingsMsg =
-                    `⚙️ *BOT SETTINGS* ⚙️\n\n` +
+                await sock.sendMessage(senderJid, { text: 'Pong! Bot is online and listening 🟢' }, { quoted: m });
+            } 
+            else if (command === 'settings') {
+                const settingsMsg = 
+                    `⚙️ *BOT SETTINGS PANEL* ⚙️\n\n` +
                     `• *Prefix:* .\n` +
                     `• *Anti-View Once:* Active 🟢\n` +
-                    `• *Status:* Connected`;
+                    `• *Status:* Connected & Responsive`;
                 await sock.sendMessage(senderJid, { text: settingsMsg }, { quoted: m });
             }
         });
