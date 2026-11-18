@@ -1,10 +1,13 @@
 {
-  "name": "whatsapp-pairing-backend",
-  "version": "1.0.0",
-  "description": "WhatsApp QR and pairing backend",
+  "name": "olly-md",
+  "version": "2.0.0",
+  "description": "OLLY MD Multi-User WhatsApp Bot",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@whiskeysockets/baileys": "6.7.9",
