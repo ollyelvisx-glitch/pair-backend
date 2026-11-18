@@ -3,8 +3,9 @@ const cors = require('cors');
 const pino = require('pino');
 const path = require('path');
 const { rimraf } = require('rimraf');
+const fs = require('fs');
 const makeWASocket = require('@whiskeysockets/baileys').default;
-const { useMultiFileAuthState, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { useMultiFileAuthState, fetchLatestBaileysVersion, Browsers, delay } = require('@whiskeysockets/baileys');
 
 const app = express();
 app.use(cors());
@@ -17,7 +18,6 @@ app.get('/pair', async (req, res) => {
         return res.status(400).json({ error: "Phone number is required" });
     }
 
-    // Sanitize phone number (digits only)
     phone = phone.replace(/[^0-9]/g, '');
 
     if (phone.length < 10) {
@@ -32,10 +32,10 @@ app.get('/pair', async (req, res) => {
 
         const sock = makeWASocket({
             version,
-            logger: pino({ level: 'fatal' }),
+            logger: pino({ level: 'silent' }),
             printQRInTerminal: false,
             auth: state,
-            browser: Browsers.macOS("Chrome") // Using standard Baileys macOS browser profile
+            browser: Browsers.macOS("Chrome")
         });
 
         sock.ev.on('creds.update', saveCreds);
@@ -43,38 +43,42 @@ app.get('/pair', async (req, res) => {
         let codeSent = false;
 
         sock.ev.on('connection.update', async (update) => {
-            const { connection } = update;
+            const { connection, lastDisconnect } = update;
 
             if (!sock.authState.creds.registered && !codeSent) {
                 codeSent = true;
                 try {
-                    // Wait a moment for socket to stabilize before requesting code
-                    await new Promise(r => setTimeout(r, 3000));
+                    await delay(3000);
                     const code = await sock.requestPairingCode(phone);
                     
                     if (!res.headersSent) {
                         res.json({ success: true, code: code });
                     }
-
-                    // Clean up session folder after 45 seconds
-                    setTimeout(async () => {
-                        try {
-                            sock.ws.close();
-                            rimraf.sync(sessionDir);
-                        } catch (e) {}
-                    }, 45000);
-
                 } catch (err) {
                     console.error("Error requesting code:", err);
                     if (!res.headersSent) {
                         res.status(500).json({ error: "Failed to generate pairing code." });
                     }
-                    rimraf.sync(sessionDir);
                 }
             }
 
             if (connection === 'open') {
                 console.log(`[+] Phone ${phone} connected successfully!`);
+                
+                // Once connected, read the creds file and generate a Session ID string
+                setTimeout(async () => {
+                    try {
+                        const credsPath = path.join(sessionDir, 'creds.json');
+                        if (fs.existsSync(credsPath)) {
+                            const credsData = fs.readFileSync(credsPath, 'utf8');
+                            // Base64 encode the creds as a Session ID string
+                            const sessionId = Buffer.from(credsData).toString('base64');
+                            console.log("Generated Session ID:", sessionId);
+                        }
+                    } catch (e) {
+                        console.error("Error reading creds:", e);
+                    }
+                }, 2000);
             }
         });
 
@@ -83,7 +87,6 @@ app.get('/pair', async (req, res) => {
         if (!res.headersSent) {
             res.status(500).json({ error: "Internal server error." });
         }
-        rimraf.sync(sessionDir);
     }
 });
 
