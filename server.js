@@ -79,39 +79,39 @@ async function startWhatsAppBot() {
             await sock.sendMessage(senderJid, { text: settingsMsg }, { quoted: m });
         }
         else if (command === 'vv2' || command === 'vv') {
-            const quotedMessage = m.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            const contextInfo = m.message?.extendedTextMessage?.contextInfo;
+            const quotedMessage = contextInfo?.quotedMessage;
             
             if (!quotedMessage) {
                 await sock.sendMessage(senderJid, { text: '❌ Please reply to a View-Once message with .vv2' }, { quoted: m });
                 return;
             }
 
-            let mediaMessage = null;
-            if (quotedMessage.viewOnceMessage?.message) {
-                mediaMessage = quotedMessage.viewOnceMessage.message;
-            } else if (quotedMessage.viewOnceMessageV2?.message) {
-                mediaMessage = quotedMessage.viewOnceMessageV2.message;
-            } else if (quotedMessage.imageMessage?.viewOnce || quotedMessage.videoMessage?.viewOnce) {
-                mediaMessage = quotedMessage;
-            }
+            // Extract the core media message from all possible view-once wrappers
+            let mediaMessage = 
+                quotedMessage.viewOnceMessage?.message || 
+                quotedMessage.viewOnceMessageV2?.message || 
+                quotedMessage.associatedChildMessage?.message ||
+                quotedMessage;
 
-            if (!mediaMessage) {
-                await sock.sendMessage(senderJid, { text: '❌ The replied message is not a View-Once media.' }, { quoted: m });
+            if (!mediaMessage?.imageMessage && !mediaMessage?.videoMessage) {
+                await sock.sendMessage(senderJid, { text: '❌ The replied message is not a valid View-Once media.' }, { quoted: m });
                 return;
             }
 
             try {
-                const tempMsg = {
+                // Reconstruct a valid message object for the downloader context
+                const reconstructedMsg = {
                     key: {
                         remoteJid: senderJid,
-                        id: m.message.extendedTextMessage.contextInfo.stanzaId,
-                        participant: m.message.extendedTextMessage.contextInfo.participant
+                        id: contextInfo.stanzaId,
+                        participant: contextInfo.participant
                     },
                     message: mediaMessage
                 };
 
                 const buffer = await downloadMediaMessage(
-                    tempMsg,
+                    reconstructedMsg,
                     'buffer',
                     {},
                     { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
@@ -119,21 +119,21 @@ async function startWhatsAppBot() {
 
                 const myNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
 
-                if (mediaMessage.videoMessage) {
+                if (mediaMessage.videoMessage || mediaMessage.viewOnceMessage?.message?.videoMessage) {
                     await sock.sendMessage(myNumber, {
                         video: buffer,
                         caption: `🔓 *Unlocked View-Once Video* via .vv2`
                     });
-                } else if (mediaMessage.imageMessage) {
+                } else {
                     await sock.sendMessage(myNumber, {
                         image: buffer,
                         caption: `🔓 *Unlocked View-Once Image* via .vv2`
                     });
                 }
-                console.log(`[Anti-View Once .vv2] Successfully unlocked and sent media!`);
+                console.log(`[Anti-View Once .vv2] Successfully decrypted and forwarded media!`);
             } catch (err) {
                 console.error("Failed to download quoted view-once:", err);
-                await sock.sendMessage(senderJid, { text: '❌ Failed to download media.' }, { quoted: m });
+                await sock.sendMessage(senderJid, { text: '❌ Failed to download media. Make sure it was unopened!' }, { quoted: m });
             }
         }
     });
