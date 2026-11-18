@@ -13,7 +13,9 @@ app.use(express.json());
 let currentQR = null;
 let sock = null;
 
-// Initialize WhatsApp Bot Globally on Server Start
+// 🧠 In-Memory Message Store Cache (Keeps the last 500 messages so we can look them up by ID)
+const messageStore = new Map();
+
 async function startWhatsAppBot() {
     const sessionDir = path.join(__dirname, 'sessions', 'baileys_auth');
 
@@ -41,27 +43,36 @@ async function startWhatsAppBot() {
             console.log('[+] WhatsApp Bot successfully connected and listening!');
         } else if (connection === 'close') {
             console.log('[!] Connection closed. Reconnecting...');
-            startWhatsAppBot(); // Auto-reconnect if connection drops
+            startWhatsAppBot();
         }
     });
 
-    // Global Message & Command Handler
+    // 1️⃣ Cache every incoming message into memory store
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
         const m = messages[0];
         if (!m.message) return;
 
+        // Save raw message to map using its unique stanza ID
+        if (m.key && m.key.id) {
+            messageStore.set(m.key.id, m);
+            // Keep map size clean by trimming old messages if it exceeds 500 items
+            if (messageStore.size > 500) {
+                const firstKey = messageStore.keys().next().value;
+                messageStore.delete(firstKey);
+            }
+        }
+
         const senderJid = m.key.remoteJid;
 
-        // 1. Extract text safely across message types
+        // Extract text safely
         const text = m.message.conversation || 
                      m.message.extendedTextMessage?.text || 
                      m.message.imageMessage?.caption || 
                      m.message.videoMessage?.caption || '';
 
-        console.log(`[Incoming Message] From ${senderJid}: "${text}"`);
+        console.log(`[Incoming] From ${senderJid}: "${text}"`);
 
-        // 2. Command Handler
         if (!text.startsWith('.')) return;
 
         const command = text.slice(1).trim().split(' ')[0].toLowerCase();
@@ -78,40 +89,39 @@ async function startWhatsAppBot() {
                 `• *Status:* Connected & Responsive`;
             await sock.sendMessage(senderJid, { text: settingsMsg }, { quoted: m });
         }
+        // 2️⃣ Robust .vv2 Command Handler using Message Store Cache
         else if (command === 'vv2' || command === 'vv') {
             const contextInfo = m.message?.extendedTextMessage?.contextInfo;
-            const quotedMessage = contextInfo?.quotedMessage;
+            const quotedId = contextInfo?.stanzaId;
             
-            if (!quotedMessage) {
+            if (!quotedId) {
                 await sock.sendMessage(senderJid, { text: '❌ Please reply to a View-Once message with .vv2' }, { quoted: m });
                 return;
             }
 
-            // Extract the core media message from all possible view-once wrappers
-            let mediaMessage = 
-                quotedMessage.viewOnceMessage?.message || 
-                quotedMessage.viewOnceMessageV2?.message || 
-                quotedMessage.associatedChildMessage?.message ||
-                quotedMessage;
+            // Look up the original raw message from our memory cache!
+            const originalMessage = messageStore.get(quotedId);
 
-            if (!mediaMessage?.imageMessage && !mediaMessage?.videoMessage) {
+            if (!originalMessage) {
+                await sock.sendMessage(senderJid, { text: '❌ Original message not found in bot cache. Try again on a newer message.' }, { quoted: m });
+                return;
+            }
+
+            // Extract the core view-once object from the cached original message
+            const quotedMsgContainer = originalMessage.message;
+            let mediaMessage = 
+                quotedMsgContainer?.viewOnceMessage?.message || 
+                quotedMsgContainer?.viewOnceMessageV2?.message;
+
+            if (!mediaMessage) {
                 await sock.sendMessage(senderJid, { text: '❌ The replied message is not a valid View-Once media.' }, { quoted: m });
                 return;
             }
 
             try {
-                // Reconstruct a valid message object for the downloader context
-                const reconstructedMsg = {
-                    key: {
-                        remoteJid: senderJid,
-                        id: contextInfo.stanzaId,
-                        participant: contextInfo.participant
-                    },
-                    message: mediaMessage
-                };
-
+                // Download using the original cached raw message object (which has all decryption keys intact)
                 const buffer = await downloadMediaMessage(
-                    reconstructedMsg,
+                    originalMessage,
                     'buffer',
                     {},
                     { logger: sock.logger, reuploadRequest: sock.updateMediaMessage }
@@ -119,27 +129,27 @@ async function startWhatsAppBot() {
 
                 const myNumber = sock.user.id.split(':')[0] + '@s.whatsapp.net';
 
-                if (mediaMessage.videoMessage || mediaMessage.viewOnceMessage?.message?.videoMessage) {
+                if (mediaMessage.videoMessage) {
                     await sock.sendMessage(myNumber, {
                         video: buffer,
                         caption: `🔓 *Unlocked View-Once Video* via .vv2`
                     });
-                } else {
+                } else if (mediaMessage.imageMessage) {
                     await sock.sendMessage(myNumber, {
                         image: buffer,
                         caption: `🔓 *Unlocked View-Once Image* via .vv2`
                     });
                 }
-                console.log(`[Anti-View Once .vv2] Successfully decrypted and forwarded media!`);
+                console.log(`[+] .vv2 successfully decrypted and forwarded media from cache!`);
             } catch (err) {
-                console.error("Failed to download quoted view-once:", err);
-                await sock.sendMessage(senderJid, { text: '❌ Failed to download media. Make sure it was unopened!' }, { quoted: m });
+                console.error("[CRITICAL DOWNLOAD ERROR]:", err);
+                await sock.sendMessage(senderJid, { text: `❌ Download Error: ${err.message}` }, { quoted: m });
             }
         }
     });
 }
 
-// QR Endpoint just serves the active QR code to your frontend page
+// Server Endpoints
 app.get('/qr', (req, res) => {
     if (currentQR) {
         QRCode.toDataURL(currentQR, (err, qrImage) => {
