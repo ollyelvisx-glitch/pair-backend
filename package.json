@@ -1,6 +1,7 @@
 {
   "name": "whatsapp-pairing-backend",
   "version": "1.0.0",
+  "description": "WhatsApp QR and pairing backend",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,9 +11,7 @@
     "cors": "^2.8.5",
     "express": "^4.19.2",
     "pino": "^9.0.0",
-    "rimraf": "^5.0.0"
-  },
-  "engines": {
-    "node": ">=20.0.0"
+    "qrcode": "^1.5.3",
+    "rimraf": "^5.0.5"
   }
 }
